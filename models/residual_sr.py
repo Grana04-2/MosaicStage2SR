@@ -43,8 +43,9 @@ class ResidualBlock(nn.Module):
         )
 
     def forward(self, x):
-
-        residual = self.conv1(x)
+        residual = self.conv1(
+            x
+        )
 
         residual = self.act(
             residual
@@ -55,9 +56,9 @@ class ResidualBlock(nn.Module):
         )
 
         return (
-            x
-            + self.block_res_scale
-            * residual
+                x
+                + self.block_res_scale
+                * residual
         )
 
 
@@ -240,65 +241,102 @@ class ResidualSRNet(nn.Module):
     def forward(
             self,
             lr,
-            mosaic=None
+            mosaic=None,
+            stage1_mask=None
     ):
-
-        # ================================================
-        # Safe base:
-        # Stage1 output only
-        # 768x432 -> 1280x720
-        # ================================================
+        # ========================================================
+        # Stage1 base
+        # ========================================================
 
         base = self.upscale_bicubic(
             lr
         )
 
-        # ================================================
-        # Detail input
-        #
-        # Single input:
-        #   Stage1 bicubic = 3ch
-        #
-        # Two input:
-        #   Stage1 bicubic   3ch
-        #   Original mosaic  3ch
-        #   --------------------
-        #   total            6ch
-        #
-        # CNN itself operates at HR resolution.
-        # ================================================
+        # ========================================================
+        # Input composition
+        # ========================================================
 
-        if mosaic is None:
+        if self.input_channels == 3:
 
-            detail_input = base
+            detail_input = (
+                base
+            )
 
-        else:
+        elif self.input_channels == 6:
 
-            if (
-                    lr.shape
-                    != mosaic.shape
-            ):
+            if mosaic is None:
                 raise RuntimeError(
-                    "Stage1 / Mosaic tensor size mismatch:\n"
-                    f"Stage1 = {tuple(lr.shape)}\n"
-                    f"Mosaic = {tuple(mosaic.shape)}"
+                    "input_channels=6 requires mosaic input."
                 )
 
-            mosaic_base = self.upscale_bicubic(
-                mosaic
+            mosaic_base = (
+                self.upscale_bicubic(
+                    mosaic
+                )
+            )
+
+            # Stage1が除去した成分
+            mosaic_residual = (
+                    mosaic_base
+                    -
+                    base
+            )
+
+            # 3ch train_A
+            # +
+            # 3ch (train_M - train_A)
+            detail_input = torch.cat(
+                [
+                    base,
+                    mosaic_residual,
+                ],
+                dim=1
+            )
+
+        elif self.input_channels == 7:
+
+            if mosaic is None:
+                raise RuntimeError(
+                    "input_channels=7 requires mosaic input."
+                )
+
+            if stage1_mask is None:
+                raise RuntimeError(
+                    "input_channels=7 requires "
+                    "stage1_mask input."
+                )
+
+            mosaic_base = (
+                self.upscale_bicubic(
+                    mosaic
+                )
+            )
+
+            mask_base = F.interpolate(
+                stage1_mask,
+                size=base.shape[-2:],
+                mode="nearest"
             )
 
             detail_input = torch.cat(
                 [
                     base,
-                    mosaic_base
+                    mosaic_base,
+                    mask_base,
                 ],
                 dim=1
             )
 
-        # ================================================
-        # Channel safety check
-        # ================================================
+        else:
+
+            raise RuntimeError(
+                "Unsupported input_channels: "
+                f"{self.input_channels}"
+            )
+
+        # ========================================================
+        # Safety check
+        # ========================================================
 
         if (
                 detail_input.shape[1]
@@ -310,17 +348,13 @@ class ResidualSRNet(nn.Module):
                 f"Actual   = {detail_input.shape[1]}"
             )
 
-        # ================================================
-        # Head
-        # ================================================
+        # ========================================================
+        # Residual SR trunk
+        # ========================================================
 
         features = self.head(
             detail_input
         )
-
-        # ================================================
-        # Residual trunk
-        # ================================================
 
         trunk = self.body(
             features
@@ -332,30 +366,20 @@ class ResidualSRNet(nn.Module):
 
         features = (
                 features
-                + trunk
+                +
+                trunk
         )
-
-        # ================================================
-        # RGB high-frequency residual
-        # ================================================
 
         residual = self.tail(
             features
         )
 
-        # ================================================
-        # Final SR
-        #
-        # IMPORTANT:
-        # base uses Stage1 only.
-        # Original Mosaic contributes only through CNN.
-        # ================================================
-
         sr = (
                 base
-                + self.output_res_scale
+                +
+                self.output_res_scale
                 * residual
         )
 
-        # train時にはclampしない
         return sr
+

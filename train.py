@@ -620,21 +620,6 @@ def train_one_epoch(
         scaler,
         device,
         pixel_weight,
-        gradient_weight,
-        laplacian_weight,
-
-        region_boost,
-        region_threshold,
-        region_range,
-        region_smooth,
-
-        hard_region_boost,
-        hard_gradient_threshold,
-        hard_gradient_range,
-        hard_gradient_smooth,
-
-        supervision_boost,
-
         use_amp
 ):
     model.train()
@@ -642,13 +627,6 @@ def train_one_epoch(
     totals = {
         "total": 0.0,
         "pixel": 0.0,
-        "gradient": 0.0,
-        "laplacian": 0.0,
-        "region_score": 0.0,
-        "region_weight": 0.0,
-        "hard_score": 0.0,
-        "detail_weight": 0.0,
-
     }
 
     image_count = 0
@@ -658,6 +636,16 @@ def train_one_epoch(
             start=1
     ):
 
+        # ================================================
+        # Input
+        #
+        # lr:
+        #   train_A
+        #
+        # mosaic:
+        #   train_M
+        # ================================================
+
         lr = batch[
             "lr"
         ].to(
@@ -665,8 +653,8 @@ def train_one_epoch(
             non_blocking=True
         )
 
-        supervision = batch[
-            "supervision"
+        mosaic = batch[
+            "mosaic"
         ].to(
             device,
             non_blocking=True
@@ -688,173 +676,45 @@ def train_one_epoch(
         ):
 
             # ================================================
-            # SR
+            # 6ch Stage2
             # ================================================
 
             sr = model(
-                lr
+                lr,
+                mosaic
             )
 
             # ================================================
-            # Bicubic baseline
+            # Full-area Pixel-only
+            #
+            # overfit_multi_image と同じ意味:
+            # 全画素 weight = 1.0
             # ================================================
 
-            bicubic = (
-                model.upscale_bicubic(
-                    lr
-                )
-            )
-
-            # ================================================
-            # Region map
-            # ================================================
-
-            (
-                region_weight_map,
-                region_score
-            ) = build_region_weight(
-                bicubic=bicubic,
-                target=hr,
-                threshold=region_threshold,
-                change_range=region_range,
-                region_boost=region_boost,
-                smooth_kernel=region_smooth
-            )
-            # ================================================
-            # Hard Region Weight
-            # ================================================
-
-            if hard_region_boost > 0.0:
-
+            weight_map = torch.ones(
                 (
-                    detail_weight_map,
-                    hard_score,
-                    hard_gradient_score
-                ) = build_hard_region_weight(
-                    target=hr,
-                    base_weight=region_weight_map,
-                    region_score=region_score,
-                    hard_region_boost=hard_region_boost,
-                    gradient_threshold=hard_gradient_threshold,
-                    gradient_range=hard_gradient_range,
-                    smooth_kernel=hard_gradient_smooth
-                )
-
-            else:
-
-                # v3 / baseline互換
-                detail_weight_map = (
-                    region_weight_map
-                )
-
-                hard_score = torch.zeros_like(
-                    region_score
-                )
-
-                hard_gradient_score = torch.zeros_like(
-                    region_score
-                )
-
-            # ================================================
-            # Stage1 Mosaic supervision
-            #
-            # train_S:
-            #   LR 192x192
-            #
-            # Loss:
-            #   HR 320x320
-            #
-            # Binary maskなので nearest で拡大する。
-            # ================================================
-
-            # ================================================
-            # train_S supervision weighting
-            #
-            # train_H:
-            #   LR 192x192
-            #
-            # HR Loss:
-            #   320x320
-            #
-            # train_Sはbinary maskなのでnearestで拡大。
-            # ================================================
-
-            supervision_hr = F.interpolate(
-                supervision,
-                size=hr.shape[-2:],
-                mode="nearest"
+                    hr.shape[0],
+                    1,
+                    hr.shape[-2],
+                    hr.shape[-1]
+                ),
+                device=hr.device,
+                dtype=hr.dtype
             )
-
-            supervision_hr = supervision_hr.clamp(
-                0.0,
-                1.0
-            )
-
-            # ================================================
-            # Final weight
-            #
-            # outside train_S:
-            #   existing weight
-            #
-            # inside train_S:
-            #   existing weight + supervision_boost
-            # ================================================
-
-            pixel_weight_map = (
-                    region_weight_map
-                    +
-                    float(
-                        supervision_boost
-                    )
-                    * supervision_hr
-            )
-
-            detail_weight_map = (
-                    detail_weight_map
-                    +
-                    float(
-                        supervision_boost
-                    )
-                    * supervision_hr
-            )
-
-            # ================================================
-            # Weighted losses
-            # ================================================
 
             loss_pixel = (
                 weighted_charbonnier_loss(
                     sr,
                     hr,
-                    pixel_weight_map
-                )
-            )
-
-            loss_gradient = (
-                weighted_gradient_loss(
-                    sr,
-                    hr,
-                    detail_weight_map
-                )
-            )
-
-            loss_laplacian = (
-                weighted_laplacian_loss(
-                    sr,
-                    hr,
-                    detail_weight_map
+                    weight_map
                 )
             )
 
             loss_total = (
-                    pixel_weight
+                    float(
+                        pixel_weight
+                    )
                     * loss_pixel
-                    +
-                    gradient_weight
-                    * loss_gradient
-                    +
-                    laplacian_weight
-                    * loss_laplacian
             )
 
         # ================================================
@@ -872,7 +732,7 @@ def train_one_epoch(
         scaler.update()
 
         # ================================================
-        # Batch diagnostics
+        # Statistics
         # ================================================
 
         batch_size = (
@@ -882,42 +742,6 @@ def train_one_epoch(
         image_count += (
             batch_size
         )
-
-        region_score_mean = (
-            region_score
-            .detach()
-            .float()
-            .mean()
-            .item()
-        )
-
-        region_weight_mean = (
-            region_weight_map
-            .detach()
-            .float()
-            .mean()
-            .item()
-        )
-
-        hard_score_mean = (
-            hard_score
-            .detach()
-            .float()
-            .mean()
-            .item()
-        )
-
-        detail_weight_mean = (
-            detail_weight_map
-            .detach()
-            .float()
-            .mean()
-            .item()
-        )
-
-        # ================================================
-        # Accumulate
-        # ================================================
 
         totals[
             "total"
@@ -930,48 +754,6 @@ def train_one_epoch(
             "pixel"
         ] += (
                 loss_pixel.item()
-                * batch_size
-        )
-
-        totals[
-            "gradient"
-        ] += (
-                loss_gradient.item()
-                * batch_size
-        )
-
-        totals[
-            "laplacian"
-        ] += (
-                loss_laplacian.item()
-                * batch_size
-        )
-
-        totals[
-            "region_score"
-        ] += (
-                region_score_mean
-                * batch_size
-        )
-
-        totals[
-            "region_weight"
-        ] += (
-                region_weight_mean
-                * batch_size
-        )
-
-        totals[
-            "hard_score"
-        ] += (
-                hard_score_mean
-                * batch_size
-        )
-
-        totals[
-            "detail_weight"
-        ] += (
-                detail_weight_mean
                 * batch_size
         )
 
@@ -991,23 +773,11 @@ def train_one_epoch(
                 f"Total "
                 f"{loss_total.item():.6f} | "
                 f"Pixel "
-                f"{loss_pixel.item():.6f} | "
-                f"Grad "
-                f"{loss_gradient.item():.6f} | "
-                f"Lap "
-                f"{loss_laplacian.item():.6f} | "
-                f"Region "
-                f"{region_score_mean:.4f} | "
-                f"Weight "
-                f"{region_weight_mean:.4f} | "
-                f"Hard "
-                f"{hard_score_mean:.4f} | "
-                f"DetailW "
-                f"{detail_weight_mean:.4f}"
+                f"{loss_pixel.item():.6f}"
             )
 
     # ================================================
-    # Epoch averages
+    # Epoch average
     # ================================================
 
     image_count = max(
@@ -1018,7 +788,9 @@ def train_one_epoch(
     for key in totals:
         totals[
             key
-        ] /= image_count
+        ] /= (
+            image_count
+        )
 
     return totals
 
@@ -1068,6 +840,12 @@ def validate(
             device
         )
 
+        mosaic = batch[
+            "mosaic"
+        ].to(
+            device
+        )
+
         hr = batch[
             "hr"
         ].to(
@@ -1075,7 +853,8 @@ def validate(
         )
 
         sr = model(
-            lr
+            lr,
+            mosaic
         )
 
         sr_clamped = sr.clamp(
@@ -1250,13 +1029,21 @@ def save_fixed_sample(
         train=False,
         lr_patch_size=lr_patch_size,
         horizontal_flip=False,
-        lr_dir_name="train_H"
+        mosaic_dir_name="train_M"
     )
 
     item = fixed_dataset[0]
 
     lr = (
         item["lr"]
+        .unsqueeze(0)
+        .to(
+            device
+        )
+    )
+
+    mosaic = (
+        item["mosaic"]
         .unsqueeze(0)
         .to(
             device
@@ -1278,7 +1065,8 @@ def save_fixed_sample(
     # ================================================
 
     sr = model(
-        lr
+        lr,
+        mosaic
     ).clamp(
         0.0,
         1.0
@@ -1913,7 +1701,6 @@ def main():
         ]
 
         if len(matched_records) != 1:
-
             raise RuntimeError(
                 "Overfit stem must match exactly one record.\n"
                 f"Stem    : {overfit_stem}\n"
@@ -1921,7 +1708,6 @@ def main():
             )
 
         if args.overfit_repeat < args.batch_size:
-
             raise ValueError(
                 "--overfit_repeat must be >= --batch_size."
             )
@@ -1971,8 +1757,7 @@ def main():
         records=train_records,
         train=True,
         lr_patch_size=args.lr_patch,
-        lr_dir_name="train_H",
-        supervision_dir_name="train_S"
+        mosaic_dir_name="train_M"
     )
 
     val_dataset = Stage2SRDataset(
@@ -1981,7 +1766,7 @@ def main():
         train=False,
         lr_patch_size=args.lr_patch,
         horizontal_flip=False,
-        lr_dir_name="train_H"
+        mosaic_dir_name="train_M"
     )
 
     train_loader = DataLoader(
@@ -2010,11 +1795,11 @@ def main():
     # ================================================
 
     model = ResidualSRNet(
-        input_channels=3,
+        input_channels=6,
         channels=args.channels,
         num_blocks=args.blocks,
         block_res_scale=0.10,
-        output_res_scale=0.20,
+        output_res_scale=1.00,
         scale_num=5,
         scale_den=3
     ).to(
@@ -2279,23 +2064,7 @@ def main():
             optimizer=optimizer,
             scaler=scaler,
             device=device,
-
             pixel_weight=args.pixel_weight,
-            gradient_weight=args.gradient_weight,
-            laplacian_weight=args.laplacian_weight,
-
-            region_boost=args.region_boost,
-            region_threshold=args.region_threshold,
-            region_range=args.region_range,
-            region_smooth=args.region_smooth,
-
-            hard_region_boost=args.hard_region_boost,
-            hard_gradient_threshold=args.hard_gradient_threshold,
-            hard_gradient_range=args.hard_gradient_range,
-            hard_gradient_smooth=args.hard_gradient_smooth,
-
-            supervision_boost=args.supervision_boost,
-
             use_amp=use_amp
         )
 
@@ -2351,16 +2120,8 @@ def main():
         )
 
         print(
-            f"Train region | "
-            f"Score "
-            f"{train_results['region_score']:.4f} | "
-            f"Mean weight "
-            f"{train_results['region_weight']:.4f} | "
-            f"Hard "
-            f"{train_results['hard_score']:.4f} | "
-            f"DetailW "
-            f"{train_results['detail_weight']:.4f} | "
-
+            f"Train pixel: "
+            f"{train_results['pixel']:.6f}"
         )
 
         print(
@@ -2476,36 +2237,6 @@ def main():
                 "train_pixel":
                     train_results[
                         "pixel"
-                    ],
-
-                "train_gradient":
-                    train_results[
-                        "gradient"
-                    ],
-
-                "train_laplacian":
-                    train_results[
-                        "laplacian"
-                    ],
-
-                "train_region_score":
-                    train_results[
-                        "region_score"
-                    ],
-
-                "train_region_weight":
-                    train_results[
-                        "region_weight"
-                    ],
-
-                "train_hard_score":
-                    train_results[
-                        "hard_score"
-                    ],
-
-                "train_detail_weight":
-                    train_results[
-                        "detail_weight"
                     ],
 
                 "bicubic_psnr":
